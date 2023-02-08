@@ -1,0 +1,5 @@
+{:orders-json "data/orders.json"
+ :customer-wait-between-orders 500
+ :courier-minimum-wait-time 2000
+ :courier-maximum-wait-time 6000
+ :shelf-capacity {"hot" 10 "cold" 10 "frozen" 10 "overflow" 15}}
