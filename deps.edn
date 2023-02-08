@@ -1,0 +1,9 @@
+{:paths [:clj-paths :resource-paths]
+ :aliases {:clj-paths ["src/clj"]
+           :resource-paths ["resources"]}
+ :deps {org.clojure/clojure {:mvn/version "1.11.1"}
+        org.clojure/core.async {:mvn/version "1.6.673"}
+        org.clojure/tools.logging {:mvn/version "1.2.4"}
+        org.clojure/data.json {:mvn/version "2.4.0"}
+        cprop {:mvn/version "0.1.19"}}
+ :jvm-opts ["-Dclojure.tools.logging.factory=clojure.tools.logging.impl/jul-factory"]}
