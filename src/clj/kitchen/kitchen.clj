@@ -126,7 +126,7 @@
 
   If the order is found we assoc :pickup-successful true. Otherwise we assoc
   false."
-  [pick-up-area {:keys [temp id]}]
+  [pick-up-area {:keys [temp id] :as order}]
   (let [mark-picked-up #(assoc % :picked-up true)]
     (cond
       (get-in pick-up-area [temp id]) 
@@ -138,7 +138,7 @@
        (assoc (get-in pick-up-area ["overflow" id]) :pickup-successful true)]
 
       :else
-      [pick-up-area (assoc (get-in pick-up-area ["overflow" id]) :pickup-successful false)])))
+      [pick-up-area (assoc order :pickup-successful false)])))
 
 (def report-ch
   "A channel for debugging/testing purposes. We use this to signal the services
