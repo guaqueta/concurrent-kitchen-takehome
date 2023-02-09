@@ -1,160 +1,229 @@
 (ns kitchen.kitchen
+  "Emulate a kitchen that receives, processes, and delivers orders.
+
+  There are two services: the kitchen-service and the courier-service. The
+  kitchen-service receives orders on the `orders-ch` channel, cooks them,
+  dispatches couriers, and hands off cooked orders to arriving couriers. It
+  has internal state (the pick-up-area) to hold orders while waiting for
+  couriers to pickup. The pick-up-area has limited capacity, which is
+  configurable via the :shelf-capacity value in config.edn. If there are too
+  many incoming orders, eventually some orders will be dropped and the courier
+  will fail to pick them up.
+
+  The courier-service receives dispatch requests and schedules couriers to go
+  pick up orders. It also delivers orders that have been picked up. The
+  couriers wait a random amount of time before pickup, which is configurable
+  via the :courier-minimum-wait-time and :courier-maximum-wait-time values in
+  config.edn.
+
+  We use `mount` to manage the service lifecycle."
   (:require [clojure.core.async :as async]
             [clojure.tools.logging.readable :as log]
             [kitchen.config :as config]
             [mount.core :as mount]))
 
 (def orders-ch
-  "Queue of orders for the kitchen to process" ;; TODO Add rationale for buffering options
+  "Orders for the kitchen to process. This is the entry point for the customer
+  to place orders. Other channels here are for internal use between the
+  kitchen-service and courier-service" ;; TODO Add rationale for buffering options
   (async/chan))
 
 (def pickup-ch
-  "Queue of couriers picking up specific dishes." ;; TODO clean up doc language
+  "Couriers picking up specific orders from the kitchen. The courier-service
+  sends orders to this channel for the kitchen to fulfill."
   (async/chan))
 
 (def dispatch-ch
-  "Queue of dispatch requests for couriers." ;; TODO clean up doc language
+  "Dispatch requests for couriers. When the kitchen receives new orders, it asks
+  the courier service to schedule a courier by placing the order here."
   (async/chan))
 
 (def delivery-ch 
-  "Queue of Couriers that have picked up their orders" ;; TODO clean up doc language
+  "Couriers that have picked up their orders. The kitchen hands off cooked
+  orders here for delivery"
   (async/chan))
 
-(def kitchen-report-ch (async/chan)) ;;; TODO - remove
-(def courier-report-ch (async/chan)) ;;; TODO - remove
-(def report-in (async/chan)) ;;; TODO - remove
-(def report-out (async/mult report-in))
-(async/tap report-out kitchen-report-ch)
-(async/tap report-out courier-report-ch)
-
-(defn cook [order]
+(defn cook 
+  "Cook the order. Essentially a placeholder for presumably more complex logic
+  to come. Returns an order."
+  [order]
   (assoc order :cooked true))
 
-(defn make-empty-shelf []
+(defn make-empty-pick-up-area
+  "Returns a pick-up-area with no dishes on it. A pick-up-area is a map of
+  temperatures to shelves, where each shelf in turn is a map of order ids to
+  orders. We represent shelves as maps so that we can efficiently hand-off
+  specific dishes to arriving couriers. This does imply that we assume order
+  ids to be unique."
+  []
   {"hot" {}
    "cold" {}
    "frozen" {}
    "overflow" {}})
 
-(defn shelf-availability [shelf]
+(defn abbrev-order [order]
+  (str (:name order) ":" (apply str (take 6 (:id order)))))
+
+(defn abbrev-pick-up-area [pick-up-area]
+  (sort-by first
+           (map (fn [[k v]] 
+                  [k (count v) (sort (map abbrev-order (vals v)))])
+                pick-up-area)))
+
+(defn log [event order pick-up-area]
+  (if (config/env :abbrev-logs)
+    (log/info event {:order (abbrev-order order) :pick-up-area (abbrev-pick-up-area pick-up-area)})
+    (log/info event {:order order :pick-up-area pick-up-area})))
+
+(defn- pick-up-area-availability
+  "Return a map with the number of available slots for each shelf in the
+  pick-up-area."
+  [pick-up-area]
   (into {}
         (map (fn [[k v]]
                [k
                 (- (get-in config/env [:shelf-capacity k])
                    (count v))])
-             shelf)))
+             pick-up-area)))
 
-(defn abridge-order [order]
-  (str (:name order) ":" (apply str (take 6 (:id order)))))
+(defn put-on-pick-up-area
+  "Put the given order on the best available shelf of the pick-up-area.
 
-(defn abridge-shelf [shelf]
-  (sort-by first
-           (map (fn [[k v]] 
-                  [k (count v) (sort (map abridge-order (vals v)))])
-                shelf)))
+  First the shelf of the appropriate temperature. If that fails, try to put
+  the order on the overflow shelf. If that fails, try to make room by finding
+  an item on the overflow shelf that can be moved to its appropriate shelf. If
+  that fails, randomly pick an item from the overflow shelf to drop. Always
+  succeeds in putting the order down.
 
-(defn put-on-shelf [shelf {:keys [temp id] :as order}]
-  (let [availability (shelf-availability shelf)]
-    ;; TODO replace attempts at placing items on shelf with an `or` (instead of ugly nested `if`)
+  Returns a pick-up-area."
+  [pick-up-area {:keys [temp id] :as order}]
+  (let [availability (pick-up-area-availability pick-up-area)]
     (if (pos? (availability temp))
       (do
         (log/info "put-on-shelf found room on " temp)
-        (assoc-in shelf [temp id] order))
+        (assoc-in pick-up-area [temp id] order))
       (if (pos? (availability "overflow"))
         (do
           (log/info "put-on-shelf found room on overflow")
-          (assoc-in shelf ["overflow" id] order))
+          (assoc-in pick-up-area ["overflow" id] order))
         ;; Try to find an order that can be moved off the overflow
-        (if-let [movable-order (->> (vals (shelf "overflow"))
+        (if-let [movable-order (->> (vals (pick-up-area "overflow"))
                                     (filter (fn [{:keys [temp]}] (pos? (availability temp))))
                                     first)]
           (do
-            (log/info "put-on-shelf found an order to move" (abridge-order movable-order))
-            (-> shelf
+            (log/info "put-on-shelf found an order to move" (abbrev-order movable-order))
+            (-> pick-up-area
                (update-in ["overflow"] dissoc (:id movable-order))
                (assoc-in [(movable-order :temp) (:id movable-order)] movable-order)
                (assoc-in ["overflow" id] order)))
-          (let [discard (rand-nth (into [] (shelf "overflow")))]
-            (log/info "put-on-shelf forced to discard an order" (abridge-order (second discard)))
-            (-> shelf
+          (let [discard (rand-nth (into [] (pick-up-area "overflow")))]
+            (log/info "put-on-shelf forced to discard an order" (abbrev-order (second discard)))
+            (-> pick-up-area
                (update-in ["overflow"] dissoc (first discard))
                (assoc-in ["overflow" id] order))))))))
 
-(defn pickup-order [shelf {:keys [temp id]}]
+(defn pickup-order
+  "Remove the desired order from the pick-up-area. Returns a vector
+  of [pick-up-area order]. If the order is not in the pick-up-area it will
+  return nil for the order."
+  [pick-up-area {:keys [temp id]}]
   (let [mark-picked-up #(assoc % :picked-up true)]
     (cond
-      (get-in shelf [temp id]) 
-      [(update-in shelf [temp] dissoc id) (mark-picked-up (get-in shelf [temp id]))]
+      (get-in pick-up-area [temp id]) 
+      [(update-in pick-up-area [temp] dissoc id) (mark-picked-up (get-in pick-up-area [temp id]))]
 
-      (get-in shelf ["overflow" id])
-      [(update-in shelf ["overflow"] dissoc id) (mark-picked-up (get-in shelf ["overflow" id]))]
+      (get-in pick-up-area ["overflow" id])
+      [(update-in pick-up-area ["overflow"] dissoc id) (mark-picked-up (get-in pick-up-area ["overflow" id]))]
 
       :else
-      [shelf nil])))
+      [pick-up-area nil])))
 
-(defn log [event order shelf]
-  (if (config/env :abridged-logs)
-    (log/info event {:order (abridge-order order) :shelf (abridge-shelf shelf)})
-    (log/info event {:order order :shelf shelf})))
+(def report-ch
+  "A channel for debugging/testing purposes. We use this to signal the services
+  that we want a readout of their internal states. Not used during normal
+  operation."
+  (async/chan))
 
-(defn sample-courier-wait-time []
+(def report-mult
+  "A mult on the report-ch so that we can get both services to report."
+  (async/mult report-in))
+
+(defn kitchen-service
+  "Start the kitchen service, which runs asynchronously in a go-loop. The
+  service listens on four channels:
+  
+  - stop-ch: For stopping the service.
+  - report-ch: For debugging/testing. Trigger a log of the current pick-up-area
+  - orders-ch: Incoming orders from customers
+  - pickup-ch: Incoming couriers for pickup
+
+  Returns the stop-ch so that `mount` can stop the service when needed."
+  []
+  (let [stop-ch (async/chan)
+        report-ch (async/chan)]
+    (async/tap report-mult report-ch)
+    (async/go-loop [pick-up-area (make-empty-pick-up-area)]
+      (when-let [pick-up-area
+                 (async/alt!
+                   stop-ch nil
+                   report-ch ([_ _] (log/info "KITCHEN REPORT" (abbrev-pick-up-area pick-up-area)) pick-up-area)
+
+                   orders-ch
+                   ([order _]
+                    (log "Kitchen received order" order pick-up-area)
+                    ;; TODO respect backpressure?
+                    (async/>! dispatch-ch order)
+                    ;; TODO log
+                    (let [pick-up-area (put-on-pick-up-area pick-up-area (cook order))]
+                      (log "Kitchen cooked and placed order" order pick-up-area)
+                      pick-up-area))
+
+                   pickup-ch
+                   ([order _]
+                    (log "Kitchen received courier" order pick-up-area)
+                    (let [[pick-up-area order] (pickup-order pick-up-area order)]
+                      ;;(log "Kitchen attempted to give courier order" order pick-up-area)
+                      (if order
+                        (async/>! delivery-ch order)
+                        (log "Courier failed to find order" order pick-up-area))
+                      ;; TODO log
+                      pick-up-area)))]
+        (recur pick-up-area)))
+    stop-ch))
+
+(mount/defstate kitchen 
+  :start (kitchen-service)
+  :stop (async/>!! kitchen true))
+
+(defn sample-courier-wait-time
+  "Generate a random time for a courier to wait before going to pick up its
+  order. The distribution is governed by the values in config/env"
+  []
   (let [min-time (config/env :courier-minimum-wait-time)
         max-time (config/env :courier-maximum-wait-time)]
     (+ min-time (Math/round (* (rand) (- max-time min-time))))))
 
-(defn kitchen-machine []
-  (let [my-id (java.util.UUID/randomUUID)
-        stop-ch (async/chan)]
-    (async/go-loop [shelf (make-empty-shelf)]
-      (when-let [shelf (async/alt!
-                         
-                         stop-ch nil
-                         
-                         kitchen-report-ch ([_ _] (log/info "KITCHEN REPORT" my-id (abridge-shelf shelf)) shelf)
+(defn courier-service
+  "Start the courier service, which runs asynchronously in a go-loop. The
+  service listens on four channels:
+  
+  - stop-ch: For stopping the service.
+  - dispatch-ch: Incoming dispatch requests
+  - deliver-ch: Incoming couriers for delivery
 
-                         orders-ch
-                         ([order _]
-                          (log "Kitchen received order" order shelf)
-                          ;; TODO respect backpressure?
-                          (async/>! dispatch-ch order)
-                          ;; TODO log
-                          (let [shelf (put-on-shelf shelf (cook order))]
-                            (log "Kitchen cooked and placed order" order shelf)
-                            shelf))
-
-                         pickup-ch
-                         ([order _]
-                          (log "Kitchen received courier" order shelf)
-                          (let [[shelf order] (pickup-order shelf order)]
-                            ;;(log "Kitchen attempted to give courier order" order shelf)
-                            (if order
-                              (async/>! delivery-ch order)
-                              (log "Courier failed to find order" order shelf))
-                            ;; TODO log
-                            shelf)))]
-        (recur shelf)))
-    stop-ch))
-
-(mount/defstate kitchen 
-  :start (kitchen-machine)
-  :stop (async/>!! kitchen true))
-
-(defn courier-machine []
-  ;; TODO documentation, also pick better name
+  Returns the stop-ch so that `mount` can stop the service when needed."
+  []
   (let [stop-ch (async/chan)]
     (async/go-loop []
       (when (async/alt!
-
               stop-ch nil
-
-              courier-report-ch ([_ _] (log/info "COURIER REPORT") true)
               
               dispatch-ch
               ([order _]
                ;; TODO docs, log
                (let [wait-time (sample-courier-wait-time)]
                  (async/go
-                   (log "Courier dispatched" order nil) ;; how to log shelf
+                   (log "Courier dispatched" order nil) ;; how to log pick-up-area
                    (async/<! (async/timeout wait-time))
                    ;; TODO log order pickup ?
                    (async/>! pickup-ch order)))
@@ -171,5 +240,5 @@
     stop-ch))
 
 (mount/defstate courier
-  :start (courier-machine)
+  :start (courier-service)
   :stop (async/>!! courier true))
