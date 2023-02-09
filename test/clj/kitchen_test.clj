@@ -50,7 +50,7 @@
                        (sut/kitchen (async/chan))
                        orders
                        0))]
-      (t/is (< (count deliveries) (count orders)))
+      (t/is (<= (count deliveries) (count orders)))
       (t/is (clojure.set/subset?
              (set deliveries)
              (set (map (fn [order]

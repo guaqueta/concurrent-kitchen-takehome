@@ -1,6 +1,6 @@
 (ns kitchen.kitchen
   "Emulate a kitchen that receives, processes, and delivers orders.
- 
+
   This namespace provides `kitchen`, a fn that returns an asynchronous machine
   that emulates a kitchen. The kitchen accepts orders on the order-ch, and
   returns finished orders on the delivery-ch. The kitchen has internal state
