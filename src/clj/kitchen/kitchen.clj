@@ -25,7 +25,7 @@
 (def orders-ch
   "Orders for the kitchen to process. This is the entry point for the customer
   to place orders. Other channels here are for internal use between the
-  kitchen-service and courier-service" ;; TODO Add rationale for buffering options
+  kitchen-service and courier-service."
   (async/chan))
 
 (def pickup-ch
@@ -40,7 +40,7 @@
 
 (def delivery-ch 
   "Couriers that have picked up their orders. The kitchen hands off cooked
-  orders here for delivery"
+  orders here for delivery."
   (async/chan))
 
 (defn cook 
@@ -124,19 +124,23 @@
 
 (defn pickup-order
   "Remove the desired order from the pick-up-area. Returns a vector
-  of [pick-up-area order]. If the order is not in the pick-up-area it will
-  return nil for the order."
+  of [pick-up-area order].
+
+  If the order is found we assoc :pickup-successful true. Otherwise we assoc
+  false."
   [pick-up-area {:keys [temp id]}]
   (let [mark-picked-up #(assoc % :picked-up true)]
     (cond
       (get-in pick-up-area [temp id]) 
-      [(update-in pick-up-area [temp] dissoc id) (mark-picked-up (get-in pick-up-area [temp id]))]
+      [(update-in pick-up-area [temp] dissoc id)
+       (assoc (get-in pick-up-area [temp id]) :pickup-successful true)]
 
       (get-in pick-up-area ["overflow" id])
-      [(update-in pick-up-area ["overflow"] dissoc id) (mark-picked-up (get-in pick-up-area ["overflow" id]))]
+      [(update-in pick-up-area ["overflow"] dissoc id)
+       (assoc (get-in pick-up-area ["overflow" id]) :pickup-successful true)]
 
       :else
-      [pick-up-area nil])))
+      [pick-up-area (assoc (get-in pick-up-area ["overflow" id]) :pickup-successful false)])))
 
 (def report-ch
   "A channel for debugging/testing purposes. We use this to signal the services
@@ -146,7 +150,7 @@
 
 (def report-mult
   "A mult on the report-ch so that we can get both services to report."
-  (async/mult report-in))
+  (async/mult report-ch))
 
 (defn kitchen-service
   "Start the kitchen service, which runs asynchronously in a go-loop. The
@@ -166,27 +170,21 @@
       (when-let [pick-up-area
                  (async/alt!
                    stop-ch nil
-                   report-ch ([_ _] (log/info "KITCHEN REPORT" (abbrev-pick-up-area pick-up-area)) pick-up-area)
+                   report-ch ([_ _] (log/info "KITCHEN report" (abbrev-pick-up-area pick-up-area)) pick-up-area)
 
                    orders-ch
                    ([order _]
-                    (log "Kitchen received order" order pick-up-area)
-                    ;; TODO respect backpressure?
+                    (log "KITCHEN received order" order pick-up-area)
                     (async/>! dispatch-ch order)
-                    ;; TODO log
                     (let [pick-up-area (put-on-pick-up-area pick-up-area (cook order))]
-                      (log "Kitchen cooked and placed order" order pick-up-area)
+                      (log "KITCHEN cooked and placed order" order pick-up-area)
                       pick-up-area))
 
                    pickup-ch
                    ([order _]
-                    (log "Kitchen received courier" order pick-up-area)
+                    (log "KITCHEN received courier" order pick-up-area)
                     (let [[pick-up-area order] (pickup-order pick-up-area order)]
-                      ;;(log "Kitchen attempted to give courier order" order pick-up-area)
-                      (if order
-                        (async/>! delivery-ch order)
-                        (log "Courier failed to find order" order pick-up-area))
-                      ;; TODO log
+                      (async/>! delivery-ch order)
                       pick-up-area)))]
         (recur pick-up-area)))
     stop-ch))
@@ -220,12 +218,13 @@
               
               dispatch-ch
               ([order _]
-               ;; TODO docs, log
+               ;; When we receive a dispatch request, we create a courier that
+               ;; will wait a random amount of time before going to pick up
+               ;; the order.
                (let [wait-time (sample-courier-wait-time)]
+                 (log/info "COURIER dispatched" order)
                  (async/go
-                   (log "Courier dispatched" order nil) ;; how to log pick-up-area
                    (async/<! (async/timeout wait-time))
-                   ;; TODO log order pickup ?
                    (async/>! pickup-ch order)))
                true)
 
@@ -234,7 +233,7 @@
                ;; The Challenge Prompt didn't specify what 'delivery'
                ;; means. All we do here is log the fact that the delivery
                ;; happened.
-               (log "Courier delivered" order nil)
+               (log/info "COURIER returned from pick-up-area" order)
                true))
         (recur)))
     stop-ch))
