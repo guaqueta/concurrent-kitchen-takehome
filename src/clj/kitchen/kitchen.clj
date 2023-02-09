@@ -22,28 +22,7 @@
             [kitchen.config :as config]
             [mount.core :as mount]))
 
-(def orders-ch
-  "Orders for the kitchen to process. This is the entry point for the customer
-  to place orders. Other channels below are for internal use between the
-  kitchen-service and courier-service."
-  (async/chan))
-
-(def pickup-ch
-  "Couriers picking up specific orders from the kitchen. The courier-service
-  sends orders to this channel for the kitchen to fulfill."
-  (async/chan))
-
-(def dispatch-ch
-  "Dispatch requests for couriers. As the kitchen receives new orders, it asks
-  the courier-service to schedule a courier by sending orders here."
-  (async/chan))
-
-(def delivery-ch 
-  "Couriers that have picked up their orders. The kitchen hands-off cooked
-  orders here for delivery."
-  (async/chan))
-
-(defn- cook 
+(defn- cook
   "Cook the order. Essentially a placeholder for presumably more complex logic
   to come. Returns an order."
   [order]
@@ -60,15 +39,6 @@
    "cold" {}
    "frozen" {}
    "overflow" {}})
-
-(defn abbrev-order [order]
-  (str (:name order) ":" (apply str (take 6 (:id order)))))
-
-(defn abbrev-pick-up-area [pick-up-area]
-  (sort-by first
-           (map (fn [[k v]] 
-                  [k (count v) (sort (map abbrev-order (vals v)))])
-                pick-up-area)))
 
 (defn- pick-up-area-availability
   "Return a map with the number of available slots for each shelf in the
@@ -129,7 +99,7 @@
   [pick-up-area {:keys [temp id] :as order}]
   (let [mark-picked-up #(assoc % :picked-up true)]
     (cond
-      (get-in pick-up-area [temp id]) 
+      (get-in pick-up-area [temp id])
       [(update-in pick-up-area [temp] dissoc id)
        (assoc (get-in pick-up-area [temp id]) :pickup-successful true)]
 
@@ -140,63 +110,6 @@
       :else
       [pick-up-area (assoc order :pickup-successful false)])))
 
-(def report-ch
-  "A channel for debugging/testing purposes. We use this to signal the services
-  that we want a readout of their internal states. Not used during normal
-  operation."
-  (async/chan))
-
-(def report-mult
-  "A mult on the report-ch so that we can get both services to report."
-  (async/mult report-ch))
-
-(defn kitchen-service
-  "Start the kitchen service, which runs asynchronously in a go-loop. The
-  service listens on four channels:
-  
-  - stop-ch: For stopping the service.
-  - report-ch: For debugging/testing. Trigger a log of the current pick-up-area
-  - orders-ch: Incoming orders from customers
-  - pickup-ch: Incoming couriers for pickup
-
-  Returns the stop-ch so that `mount` can stop the service when needed."
-  []
-  (let [stop-ch (async/chan)
-        report-ch (async/chan)]
-    (async/tap report-mult report-ch)
-    (async/go-loop [pick-up-area (make-empty-pick-up-area)]
-      (when-let [pick-up-area
-                 (async/alt!
-                   stop-ch nil
-                   report-ch ([_ _] (log/info "KITCHEN report" (abbrev-pick-up-area pick-up-area)) pick-up-area);;TODO
-
-                   orders-ch
-                   ([order _]
-                    (log/info "KITCHEN received order" order pick-up-area)
-                    (async/>! dispatch-ch order)
-                    (let [{:keys [pick-up-area shelf action affected-order]}
-                          (put-on-pick-up-area pick-up-area (cook order))]
-                      (log/info "KITCHEN cooked and placed order" order "on shelf" shelf
-                                (if action
-                                  (str "and" action affected-order)
-                                  "")
-                                pick-up-area)
-                      pick-up-area))
-
-                   pickup-ch
-                   ([order _]
-                    (log/info "KITCHEN received courier" order pick-up-area)
-                    (let [[pick-up-area order] (pickup-order pick-up-area order)]
-                      (log/info "KITCHEN courier took order" order pick-up-area)
-                      (async/>! delivery-ch order)
-                      pick-up-area)))]
-        (recur pick-up-area)))
-    stop-ch))
-
-(mount/defstate kitchen 
-  :start (kitchen-service)
-  :stop (async/>!! kitchen true))
-
 (defn sample-courier-wait-time
   "Generate a random time for a courier to wait before going to pick up its
   order. The distribution is governed by the values in config/env"
@@ -205,43 +118,65 @@
         max-time (config/env :courier-maximum-wait-time)]
     (+ min-time (Math/round (* (rand) (- max-time min-time))))))
 
-(defn courier-service
-  "Start the courier service, which runs asynchronously in a go-loop. The
-  service listens on four channels:
-  
-  - stop-ch: For stopping the service.
-  - dispatch-ch: Incoming dispatch requests
-  - deliver-ch: Incoming couriers for delivery
+(defn get-kitchen
+  "TODO"
+  [delivery-ch]
+  (let [stop-ch (async/chan)
+        report-ch (async/chan)
+        orders-ch (async/chan)
+        end-orders-ch (async/chan)
+        pickup-ch (async/chan)]
+    (async/go-loop [pick-up-area (make-empty-pick-up-area)
+                    couriers {}
+                    orders-ended false]
+      (when-let [[pick-up-area couriers orders-ended]
+                 (async/alt!
+                   ;; Provide a way to halt the machine
+                   stop-ch (log/info "STOPPING" pick-up-area couriers)
 
-  Returns the stop-ch so that `mount` can stop the service when needed."
-  []
-  (let [stop-ch (async/chan)]
-    (async/go-loop []
-      (when (async/alt!
-              stop-ch nil
-              
-              dispatch-ch
-              ([order _]
-               ;; When we receive a dispatch request, we create a courier that
-               ;; will wait a random amount of time before going to pick up
-               ;; the order.
-               (let [wait-time (sample-courier-wait-time)]
-                 (log/info "COURIER dispatched" order)
-                 (async/go
-                   (async/<! (async/timeout wait-time))
-                   (async/>! pickup-ch order)))
-               true)
+                   ;; Provide a way to peek at the internal state. For testing and debugging.
+                   report-ch (do
+                               (log/info "REPORT" pick-up-area couriers orders-ended)
+                               [pick-up-area couriers orders-ended])
 
-              delivery-ch
-              ([order _]
-               ;; The Challenge Prompt didn't specify what 'delivery'
-               ;; means. All we do here is log the fact that the delivery
-               ;; happened.
-               (log/info "COURIER returned from pick-up-area" order)
-               true))
-        (recur)))
-    stop-ch))
+                   orders-ch
+                   ([order]
+                    (log/info "order received" order pick-up-area)
+                    (let [wait-time (sample-courier-wait-time)
+                          courier (async/go
+                                    (async/<! (async/timeout wait-time))
+                                    (async/>! pickup-ch order))
+                          {:keys [pick-up-area shelf action affected-order]} (put-on-pick-up-area pick-up-area (cook order))]
+                      (log/info "courier scheduled" wait-time order pick-up-area)
+                      (log/info "order cooked and placed on shelf" order shelf (if action (str "and" action affected-order) "") pick-up-area)
+                      [pick-up-area (assoc couriers (order :id) courier) orders-ended]))
 
-(mount/defstate courier
-  :start (courier-service)
-  :stop (async/>!! courier true))
+                   pickup-ch
+                   ([order]
+                    (log/info "courier arrived" order pick-up-area)
+                    (let [[pick-up-area order] (pickup-order pick-up-area order)
+                          couriers (dissoc couriers (order :id))]
+                      (if (:pickup-successful order)
+                        (do
+                          (async/put! delivery-ch order)
+                          (log/info "order out for delivery" order pick-up-area))
+                        (log/info "order not found" order pick-up-area))
+                      (if (and orders-ended (empty? couriers))
+                        (async/close! delivery-ch)
+                        [pick-up-area couriers orders-ended])))
+
+                   ;; A signal on this channel indicates that no more orders
+                   ;; are coming. This gives us a chance to rendezvous with
+                   ;; the caller. Once we are done waiting for the last
+                   ;; couriers we can close delivery-ch
+                   end-orders-ch (do
+                                   (log/info "no more orders coming," (count couriers) "couriers in flight")
+                                   (if (empty? couriers)
+                                     (async/close! delivery-ch)
+                                     [pick-up-area couriers true])))]
+        (recur pick-up-area couriers orders-ended)))
+    {:stop stop-ch
+     :report report-ch
+     :orders orders-ch
+     :end-orders end-orders-ch
+     :delivery delivery-ch}))
