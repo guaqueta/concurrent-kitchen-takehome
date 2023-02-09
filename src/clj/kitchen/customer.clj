@@ -34,9 +34,9 @@
   place orders). This is because we are emulating orders coming in at a rate
   which the rest of the system cannot control. In other words, the kitchen can
   drop orders, but it can't ask customers to wait."
-  ([] (place-orders (count orders)))
-  ([n] (let [wait-time (config/env :customer-wait-between-orders)]
-         (async/go
-           (doseq [order (take n orders)]
-            (async/<!! (async/timeout wait-time))
-            (async/put! kitchen/orders-ch order))))))
+  [orders]
+  (let [wait-time (config/env :customer-wait-between-orders)]
+    (async/go
+      (doseq [order orders]
+        (async/<!! (async/timeout wait-time))
+        (async/put! kitchen/orders-ch order)))))
