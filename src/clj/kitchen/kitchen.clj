@@ -24,7 +24,7 @@
 
 (def orders-ch
   "Orders for the kitchen to process. This is the entry point for the customer
-  to place orders. Other channels here are for internal use between the
+  to place orders. Other channels below are for internal use between the
   kitchen-service and courier-service."
   (async/chan))
 
@@ -34,16 +34,16 @@
   (async/chan))
 
 (def dispatch-ch
-  "Dispatch requests for couriers. When the kitchen receives new orders, it asks
-  the courier service to schedule a courier by placing the order here."
+  "Dispatch requests for couriers. As the kitchen receives new orders, it asks
+  the courier-service to schedule a courier by sending orders here."
   (async/chan))
 
 (def delivery-ch 
-  "Couriers that have picked up their orders. The kitchen hands off cooked
+  "Couriers that have picked up their orders. The kitchen hands-off cooked
   orders here for delivery."
   (async/chan))
 
-(defn cook 
+(defn- cook 
   "Cook the order. Essentially a placeholder for presumably more complex logic
   to come. Returns an order."
   [order]
@@ -70,11 +70,6 @@
                   [k (count v) (sort (map abbrev-order (vals v)))])
                 pick-up-area)))
 
-(defn log [event order pick-up-area]
-  (if (config/env :abbrev-logs)
-    (log/info event {:order (abbrev-order order) :pick-up-area (abbrev-pick-up-area pick-up-area)})
-    (log/info event {:order order :pick-up-area pick-up-area})))
-
 (defn- pick-up-area-availability
   "Return a map with the number of available slots for each shelf in the
   pick-up-area."
@@ -95,32 +90,35 @@
   that fails, randomly pick an item from the overflow shelf to drop. Always
   succeeds in putting the order down.
 
-  Returns a pick-up-area."
+  Returns a map describing the results of the action:
+  - :pick-up-area updated pick-up-area
+  - :shelf the key to the shelf where the order was placed
+  - :action one of :moved or :discarded, if those actions had to be taken to
+            make room for the order.
+  - :affected-order the affected order if an action was taken"
   [pick-up-area {:keys [temp id] :as order}]
   (let [availability (pick-up-area-availability pick-up-area)]
-    (if (pos? (availability temp))
-      (do
-        (log/info "put-on-shelf found room on " temp)
-        (assoc-in pick-up-area [temp id] order))
-      (if (pos? (availability "overflow"))
-        (do
-          (log/info "put-on-shelf found room on overflow")
-          (assoc-in pick-up-area ["overflow" id] order))
-        ;; Try to find an order that can be moved off the overflow
-        (if-let [movable-order (->> (vals (pick-up-area "overflow"))
-                                    (filter (fn [{:keys [temp]}] (pos? (availability temp))))
-                                    first)]
-          (do
-            (log/info "put-on-shelf found an order to move" (abbrev-order movable-order))
-            (-> pick-up-area
-               (update-in ["overflow"] dissoc (:id movable-order))
-               (assoc-in [(movable-order :temp) (:id movable-order)] movable-order)
-               (assoc-in ["overflow" id] order)))
-          (let [discard (rand-nth (into [] (pick-up-area "overflow")))]
-            (log/info "put-on-shelf forced to discard an order" (abbrev-order (second discard)))
-            (-> pick-up-area
-               (update-in ["overflow"] dissoc (first discard))
-               (assoc-in ["overflow" id] order))))))))
+    (cond
+      (pos? (availability temp)) {:pick-up-area (assoc-in pick-up-area [temp id] order)
+                                  :shelf temp}
+      (pos? (availability "overflow")) {:pick-up-area (assoc-in pick-up-area ["overflow" id] order)
+                                        :shelf "overflow"}
+      :else (if-let [move-order (->> (vals (pick-up-area "overflow"))
+                                     (filter (fn [{:keys [temp]}] (pos? (availability temp))))
+                                     first)]
+              {:pick-up-area (-> pick-up-area
+                                 (update-in ["overflow"] dissoc (:id move-order))
+                                 (assoc-in [(move-order :temp) (:id move-order)] move-order)
+                                 (assoc-in ["overflow" id] order))
+               :shelf "overflow"
+               :action :moved
+               :affected-order move-order}
+              (let [discard-order (rand-nth (vals (pick-up-area "overflow")))]
+                {:pick-up-area (-> pick-up-area
+                                   (update-in ["overflow"] dissoc (:id discard-order))
+                                   (assoc-in ["overflow" id] order))
+                 :action :discarded
+                 :affected-order discard-order})))))
 
 (defn pickup-order
   "Remove the desired order from the pick-up-area. Returns a vector
@@ -170,20 +168,26 @@
       (when-let [pick-up-area
                  (async/alt!
                    stop-ch nil
-                   report-ch ([_ _] (log/info "KITCHEN report" (abbrev-pick-up-area pick-up-area)) pick-up-area)
+                   report-ch ([_ _] (log/info "KITCHEN report" (abbrev-pick-up-area pick-up-area)) pick-up-area);;TODO
 
                    orders-ch
                    ([order _]
-                    (log "KITCHEN received order" order pick-up-area)
+                    (log/info "KITCHEN received order" order pick-up-area)
                     (async/>! dispatch-ch order)
-                    (let [pick-up-area (put-on-pick-up-area pick-up-area (cook order))]
-                      (log "KITCHEN cooked and placed order" order pick-up-area)
+                    (let [{:keys [pick-up-area shelf action affected-order]}
+                          (put-on-pick-up-area pick-up-area (cook order))]
+                      (log/info "KITCHEN cooked and placed order" order "on shelf" shelf
+                                (if action
+                                  (str "and" action affected-order)
+                                  "")
+                                pick-up-area)
                       pick-up-area))
 
                    pickup-ch
                    ([order _]
-                    (log "KITCHEN received courier" order pick-up-area)
+                    (log/info "KITCHEN received courier" order pick-up-area)
                     (let [[pick-up-area order] (pickup-order pick-up-area order)]
+                      (log/info "KITCHEN courier took order" order pick-up-area)
                       (async/>! delivery-ch order)
                       pick-up-area)))]
         (recur pick-up-area)))
