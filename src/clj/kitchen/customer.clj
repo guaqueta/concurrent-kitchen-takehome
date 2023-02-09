@@ -7,10 +7,14 @@
             [clojure.java.io :as io]))
 
 (def orders
-  (let [base-orders (json/read-str
+  (json/read-str
+   (slurp (io/resource (config/env :orders-json)))
+   :key-fn keyword)
+  #_(let [base-orders (json/read-str
                      (slurp (io/resource (config/env :orders-json)))
                      :key-fn keyword)]
-    (mapcat (comp shuffle #(map (fn [order] (assoc order :id (str (java.util.UUID/randomUUID)))) %)) (repeat 1000 base-orders))))
+    (mapcat (comp shuffle #(map (fn [order] (assoc order :id (str (java.util.UUID/randomUUID)))) %))
+            (repeat 10 base-orders))))
 
 (defn place-orders
   "Emulates customers placing orders on the system. Orders are placed
@@ -21,14 +25,13 @@
   Note we are deliberately not respecting back-pressure here. We are emulating
   orders coming in at a rate which the rest of the system cannot control. TODO
   is this really what I want"
-  []
-  (let [wait-time 1; (config/env :customer-wait-between-orders)
+  [n]
+  (let [wait-time 10; (config/env :customer-wait-between-orders)
         ]
-    (doseq [order (take 100000 orders)] ;; XXX
-      #_(log/info "customer waiting to send order")
-      (Thread/sleep wait-time)
-      ;; TODO error handling
-      #_(log/info "customer sending order" (:name order))
+    (doseq [order (take n orders)] ;; XXX
+      (async/<!! (async/timeout wait-time))
+      ;; TODO error handling, rationale for not respecting backpressure
+      (log/info "Customer placing order")
       (async/put! kitchen/orders-ch order)
       #_(async/>!! kitchen/orders-ch order) ;;xxx
       )))
